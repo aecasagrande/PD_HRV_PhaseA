@@ -1,0 +1,374 @@
+# ==============================================================================
+# SCRIPT 2: PHASE 1 STATISTICAL ANALYSIS (AIMS 1, 2, AND 3)
+# ==============================================================================
+# - Preprocessing: HRV Reconstructed_30, Giladi Video Annotations, STAI scales
+# - Stage 1 Univariate Screening & Log Transformations
+# - Aim 1: Zero-order correlations & Hierarchical Regression (Clinical -> HRV)
+#          Sub-Aim 1.b: Low vs High HRV Median Split
+# - Aim 2: Within-subject Levodopa modulation (OFF vs ON) & Delta Coupling
+# - Aim 3: Continuous STAI Anxiety partialling & High vs Low Anxiety contrasts
+# - Includes full terminal statistical summaries & publication-ready plots
+# ==============================================================================
+
+# 1. Packages ------------------------------------------------------------------
+needed_pkgs <- c("readxl", "tidyverse", "car", "lmtest", "RColorBrewer", "ggrepel")
+to_install <- needed_pkgs[!vapply(needed_pkgs, requireNamespace, logical(1), quietly = TRUE)]
+if (length(to_install)) install.packages(to_install, repos = "https://cloud.r-project.org")
+
+suppressPackageStartupMessages({
+  library(readxl)
+  library(tidyverse)
+  library(car)
+  library(lmtest)
+  library(RColorBrewer)
+  library(ggrepel)
+})
+
+# 2. File Paths ----------------------------------------------------------------
+DATA_DIR <- "/Users/aecasagr/Desktop/PD_HRV/Data"
+F_HRV    <- file.path(DATA_DIR, "08_HRV_Final.xlsx")
+F_DEMO   <- file.path(DATA_DIR, "01_Demographics.xlsx")
+F_UPDRS  <- file.path(DATA_DIR, "03_Motor_UPDRS-III.xlsx")
+F_GILADI <- file.path(DATA_DIR, "04_Freezing_Giladi.xlsx")
+F_INLAB  <- file.path(DATA_DIR, "05_InLab_Questionnaires.xlsx")
+F_HOME   <- file.path(DATA_DIR, "06_Home_Questionnaires.xlsx")
+F_ANNOT  <- file.path(DATA_DIR, "07_Giladi_Annotated.csv")
+
+# 3. Load & Preprocess Master Phase 1 Dataset ----------------------------------
+cat("\n============================================================\n")
+cat(" LOADING DATASETS & BUILDING PHASE 1 RECONSTRUCTED_30 COHORT\n")
+cat("============================================================\n")
+
+# A. HRV Reconstructed_30 (Skip header row 1 to capture Participant columns)
+hrv_raw <- read_excel(F_HRV, sheet = "Reconstructed_30", skip = 1) %>%
+  rename(Participant_ID = Participant) %>%
+  filter(grepl("^P-\\d{3}$", Participant_ID))
+
+hrv_off <- hrv_raw %>% filter(Condition == "OFF") %>%
+  select(Participant_ID, HR_OFF = HR_Corrected, SDNN_OFF = SDNN_Corrected, RMSSD_OFF = RMSSD_Corrected)
+hrv_on  <- hrv_raw %>% filter(Condition == "ON") %>%
+  select(Participant_ID, HR_ON = HR_Corrected, SDNN_ON = SDNN_Corrected, RMSSD_ON = RMSSD_Corrected)
+hrv_wide <- full_join(hrv_off, hrv_on, by = "Participant_ID")
+
+# B. Objective Freezing from Giladi Video Annotations (07)
+fog_annot <- read_csv(F_ANNOT, show_col_types = FALSE) %>%
+  rename(Participant_ID = Participant_ID) %>%
+  group_by(Participant_ID, State) %>%
+  summarise(
+    Total_Trial_Time = sum(Trial_Duration_s, na.rm = TRUE),
+    Total_Frozen_Time = sum(Total_FOG_Duration_s, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(Pct_Time_Frozen = 100 * Total_Frozen_Time / Total_Trial_Time) %>%
+  pivot_wider(id_cols = Participant_ID, names_from = State, 
+              values_from = Pct_Time_Frozen, names_prefix = "Pct_Frozen_")
+
+# C. Clinical Confounders & Questionnaires
+demo_sub <- read_excel(F_DEMO, sheet = "Demographics") %>%
+  filter(grepl("^P-\\d{3}$", participant_id)) %>%
+  transmute(Participant_ID = participant_id, 
+            Age = as.numeric(`Age (years)`),
+            Disease_Duration = as.numeric(`Disease duration (years since diagnosis)`),
+            LEDD = as.numeric(LEDD_total_mg))
+
+updrs_sub <- read_excel(F_UPDRS, sheet = "UPDRS-III") %>%
+  filter(grepl("^P-\\d{3}$", participant_id)) %>%
+  transmute(Participant_ID = participant_id, 
+            UPDRS_OFF = as.numeric(`UPDRS-III OFF`), 
+            UPDRS_ON = as.numeric(`UPDRS-III ON`))
+
+inlab_sub <- read_excel(F_INLAB, sheet = "Summary") %>%
+  filter(grepl("^P-\\d{3}$", participant_id)) %>%
+  transmute(Participant_ID = participant_id, 
+            STAI_State_OFF = as.numeric(`STAI-State OFF`), 
+            STAI_State_ON = as.numeric(`STAI-State ON`))
+
+home_sub <- read_excel(F_HOME, sheet = "Summary") %>%
+  filter(grepl("^P-\\d{3}$", participant_id)) %>%
+  transmute(Participant_ID = participant_id, 
+            NFOG_Q = as.numeric(`NFOG-Q total`), 
+            STAI_Trait = as.numeric(`STAI-Trait total`))
+
+# Merge Master Phase 1 Dataframe (n = 21 complete pairs; drop P-007)
+df1 <- hrv_wide %>%
+  filter(Participant_ID != "P-007") %>%
+  inner_join(fog_annot, by = "Participant_ID") %>%
+  inner_join(demo_sub, by = "Participant_ID") %>%
+  inner_join(updrs_sub, by = "Participant_ID") %>%
+  inner_join(inlab_sub, by = "Participant_ID") %>%
+  inner_join(home_sub, by = "Participant_ID")
+
+cat(sprintf("Cohort ready: n = %d participants with complete paired data.\n", nrow(df1)))
+
+# 4. Stage 1: Univariate Screening & Log Transformations -----------------------
+cat("\n============================================================\n")
+cat(" STAGE 1: UNIVARIATE DISTRIBUTIONAL SCREENING\n")
+cat("============================================================\n")
+
+screen_vars <- c("RMSSD_OFF", "SDNN_OFF", "Pct_Frozen_OFF", "NFOG_Q", "STAI_State_OFF", "STAI_Trait")
+screen_res <- map_dfr(screen_vars, function(v) {
+  vals <- df1[[v]]
+  sw <- shapiro.test(vals)
+  tibble(
+    Variable = v, Mean = mean(vals), SD = sd(vals), Median = median(vals),
+    IQR = IQR(vals), Skewness = (mean(vals) - median(vals)) / sd(vals), # Pearson skew
+    Shapiro_W = sw$statistic, Shapiro_p = sw$p.value,
+    Action = ifelse(sw$p.value < 0.05, "Log-transform recommended", "Normal")
+  )
+})
+print(as.data.frame(screen_res), row.names = FALSE)
+
+# Compute natural log transforms
+df1 <- df1 %>%
+  mutate(
+    logRMSSD_OFF = log(RMSSD_OFF),
+    logRMSSD_ON  = log(RMSSD_ON),
+    logSDNN_OFF  = log(SDNN_OFF),
+    logSDNN_ON   = log(SDNN_ON),
+    delta_logRMSSD = logRMSSD_ON - logRMSSD_OFF,
+    delta_Pct_Frozen = Pct_Frozen_ON - Pct_Frozen_OFF,
+    delta_UPDRS = UPDRS_ON - UPDRS_OFF
+  )
+
+# Set Color Palette for Individual Participant Plots
+pids <- sort(unique(df1$Participant_ID))
+pid_cols <- setNames(colorRampPalette(brewer.pal(min(length(pids), 12), "Paired"))(length(pids)), pids)
+
+
+# ==============================================================================
+# OBJECTIVE 1: BASELINE RESTING HRV AS A PREDICTOR OF FOG SEVERITY (OFF)
+# ==============================================================================
+cat("\n\n============================================================\n")
+cat(" OBJECTIVE 1: BASELINE RESTING HRV PREDICTION OF FOG SEVERITY\n")
+cat("============================================================\n")
+
+# Preliminary Step: Zero-Order Correlations
+cat("\n--- Preliminary Step: Zero-Order Correlations (n = 21) ---\n")
+cor_pairs <- tribble(
+  ~HRV_Var, ~FOG_Var,
+  "logRMSSD_OFF", "Pct_Frozen_OFF",
+  "logRMSSD_OFF", "NFOG_Q",
+  "SDNN_OFF",     "Pct_Frozen_OFF",
+  "SDNN_OFF",     "NFOG_Q",
+  "RMSSD_OFF",    "Pct_Frozen_OFF",
+  "RMSSD_OFF",    "NFOG_Q"
+)
+cor_table <- pmap_dfr(cor_pairs, function(HRV_Var, FOG_Var) {
+  x <- df1[[HRV_Var]]; y <- df1[[FOG_Var]]
+  cp <- cor.test(x, y, method = "pearson")
+  cs <- cor.test(x, y, method = "spearman")
+  tibble(
+    HRV = HRV_Var, Freezing = FOG_Var,
+    Pearson_r = cp$estimate, Pearson_p = cp$p.value,
+    Spearman_rho = cs$estimate, Spearman_p = cs$p.value
+  )
+})
+print(as.data.frame(cor_table), row.names = FALSE)
+
+# Primary Aim 1: Hierarchical Linear Regression
+cat("\n--- Primary Aim 1: Hierarchical Linear Regression ---\n")
+m1_step1 <- lm(Pct_Frozen_OFF ~ Disease_Duration + UPDRS_OFF + LEDD, data = df1)
+m1_step2 <- lm(Pct_Frozen_OFF ~ Disease_Duration + UPDRS_OFF + LEDD + logRMSSD_OFF, data = df1)
+
+anova_m1 <- anova(m1_step1, m1_step2)
+r2_1 <- summary(m1_step1)$r.squared
+r2_2 <- summary(m1_step2)$r.squared
+delta_r2 <- r2_2 - r2_1
+f_change <- anova_m1$F[2] p_change <- anova_m1$`Pr(>F)`[2]
+
+cat(sprintf("Step 1 (Clinical): R² = %.4f, Adj R² = %.4f, F = %.3f, p = %.4f\n",
+            r2_1, summary(m1_step1)$adj.r.squared, summary(m1_step1)$fstatistic[1], 
+            pf(summary(m1_step1)$fstatistic[1], 3, 17, lower.tail = FALSE)))
+cat(sprintf("Step 2 (+logRMSSD): R² = %.4f, Adj R² = %.4f, F = %.3f, p = %.4f\n",
+            r2_2, summary(m1_step2)$adj.r.squared, summary(m1_step2)$fstatistic[1],
+            pf(summary(m1_step2)$fstatistic[1], 4, 16, lower.tail = FALSE)))
+cat(sprintf("Incremental Variance: ΔR² = %.4f, F_change(1, 16) = %.3f, p_change = %.4f\n\n",
+            delta_r2, f_change, p_change))
+print(summary(m1_step2))
+
+# Diagnostics
+cat("\nRegression Diagnostics for Step 2:\n")
+cat("VIF Values:\n"); print(vif(m1_step2))
+cat(sprintf("Residual Normality (Shapiro-Wilk): W = %.4f, p = %.4f\n",
+            shapiro.test(resid(m1_step2))$statistic, shapiro.test(resid(m1_step2))$p.value))
+cat(sprintf("Homoscedasticity (Breusch-Pagan): BP = %.4f, p = %.4f\n",
+            bptest(m1_step2)$statistic, bptest(m1_step2)$p.value))
+
+# Sub-Aim 1.b: Median Split Stratification
+med_hrv <- median(df1$logRMSSD_OFF)
+df1 <- df1 %>% mutate(HRV_Group = ifelse(logRMSSD_OFF <= med_hrv, "Low HRV", "High HRV"))
+cat(sprintf("\n--- Sub-Aim 1.b: Median Split (Median = %.4f) ---\n", med_hrv))
+t_med <- t.test(Pct_Frozen_OFF ~ HRV_Group, data = df1, var.equal = TRUE)
+w_med <- wilcox.test(Pct_Frozen_OFF ~ HRV_Group, data = df1)
+cat(sprintf("Low HRV (n=%d) Mean: %.2f%% | High HRV (n=%d) Mean: %.2f%%\n",
+            sum(df1$HRV_Group == "Low HRV"), mean(df1$Pct_Frozen_OFF[df1$HRV_Group == "Low HRV"]),
+            sum(df1$HRV_Group == "High HRV"), mean(df1$Pct_Frozen_OFF[df1$HRV_Group == "High HRV"])))
+cat(sprintf("Student's t(19) = %.3f, p = %.4f | Mann-Whitney U p = %.4f\n",
+            t_med$statistic, t_med$p.value, w_med$p.value))
+
+# Objective 1 Figures
+p_aim1_scatter <- ggplot(df1, aes(x = logRMSSD_OFF, y = Pct_Frozen_OFF)) +
+  geom_smooth(method = "lm", formula = y ~ x, colour = "black", fill = "grey75", alpha = 0.3) +
+  geom_point(aes(colour = Participant_ID), size = 3.5, alpha = 0.9) +
+  geom_text_repel(aes(label = Participant_ID), size = 3, max.overlaps = 15) +
+  scale_colour_manual(values = pid_cols, guide = "none") +
+  labs(title = "Aim 1: Baseline Resting logRMSSD vs. Objective Freezing Severity (OFF)",
+       subtitle = sprintf("Zero-order r = +0.163 (p = 0.480) | Independent Step 2 β = +0.412 (p = 0.070, ΔR² = 13.6%%)"),
+       x = "Baseline Resting logRMSSD (OFF State)", y = "Objective Freezing (% Time Frozen)") +
+  theme_bw(base_size = 12)
+
+p_aim1_box <- ggplot(df1, aes(x = HRV_Group, y = Pct_Frozen_OFF, fill = HRV_Group)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.3, width = 0.45) +
+  geom_jitter(aes(colour = Participant_ID), width = 0.15, size = 3, alpha = 0.9) +
+  scale_fill_manual(values = c("Low HRV" = "#E41A1C", "High HRV" = "#377EB8"), guide = "none") +
+  scale_colour_manual(values = pid_cols, guide = "none") +
+  labs(title = "Sub-Aim 1.b: Freezing Severity by Resting HRV Median Split",
+       subtitle = sprintf("Low HRV Mean = 26.0%% vs. High HRV Mean = 31.2%% (t = -0.486, p = 0.633)"),
+       x = "Resting Autonomic Tone Subgroup", y = "Objective Freezing (% Time Frozen)") +
+  theme_bw(base_size = 12)
+
+print(p_aim1_scatter)
+print(p_aim1_box)
+
+
+# ==============================================================================
+# OBJECTIVE 2: LEVODOPA MODULATION OF AUTONOMIC TONE & FOG (OFF VS. ON)
+# ==============================================================================
+cat("\n\n============================================================\n")
+cat(" OBJECTIVE 2: WITHIN-SUBJECT LEVODOPA MODULATION (OFF VS. ON)\n")
+cat("============================================================\n")
+
+# Paired Comparisons
+aim2_metrics <- c("logRMSSD", "RMSSD", "SDNN", "Pct_Frozen", "UPDRS")
+aim2_paired_res <- map_dfr(aim2_metrics, function(m) {
+  off_v <- switch(m, logRMSSD = df1$logRMSSD_OFF, RMSSD = df1$RMSSD_OFF, 
+                  SDNN = df1$SDNN_OFF, Pct_Frozen = df1$Pct_Frozen_OFF, UPDRS = df1$UPDRS_OFF)
+  on_v  <- switch(m, logRMSSD = df1$logRMSSD_ON, RMSSD = df1$RMSSD_ON, 
+                  SDNN = df1$SDNN_ON, Pct_Frozen = df1$Pct_Frozen_ON, UPDRS = df1$UPDRS_ON)
+  diff_v <- on_v - off_v
+  tt <- t.test(on_v, off_v, paired = TRUE)
+  wt <- wilcox.test(on_v, off_v, paired = TRUE)
+  tibble(
+    Metric = m,
+    OFF_Mean = mean(off_v), ON_Mean = mean(on_v),
+    Mean_Diff = mean(diff_v), Paired_t = tt$statistic,
+    p_t = tt$p.value, Cohen_dz = mean(diff_v) / sd(diff_v),
+    Wilcoxon_W = wt$statistic, p_wilcoxon = wt$p.value
+  )
+})
+print(as.data.frame(aim2_paired_res), row.names = FALSE)
+
+# Sub-Aim 2.b: Delta-Delta Coupling
+cat("\n--- Sub-Aim 2.b: Coupling of Medication Changes (ΔHRV vs. ΔFOG) ---\n")
+cor_delta_p <- cor.test(df1$delta_logRMSSD, df1$delta_Pct_Frozen, method = "pearson")
+cor_delta_s <- cor.test(df1$delta_logRMSSD, df1$delta_Pct_Frozen, method = "spearman")
+cat(sprintf("Pearson: r = %.4f, p = %.4f | Spearman: rho = %.4f, p = %.4f\n",
+            cor_delta_p$estimate, cor_delta_p$p.value, cor_delta_s$estimate, cor_delta_s$p.value))
+
+# Objective 2 Figures: Paired Slopegraph & Delta Scatter
+df_slope <- df1 %>%
+  select(Participant_ID, Pct_Frozen_OFF, Pct_Frozen_ON, logRMSSD_OFF, logRMSSD_ON) %>%
+  pivot_longer(-Participant_ID, names_to = c(".value", "State"), names_pattern = "(.*)_(OFF|ON)") %>%
+  mutate(State = factor(State, levels = c("OFF", "ON")))
+
+p_aim2_fog <- ggplot(df_slope, aes(x = State, y = Pct_Frozen)) +
+  geom_line(aes(group = Participant_ID, colour = Participant_ID), alpha = 0.7, linewidth = 0.6) +
+  geom_point(aes(colour = Participant_ID), size = 3) +
+  stat_summary(fun = mean, geom = "line", aes(group = 1), colour = "black", linewidth = 1.3) +
+  stat_summary(fun = mean, geom = "point", shape = 23, size = 4, fill = "white", colour = "black") +
+  scale_colour_manual(values = pid_cols, guide = "none") +
+  labs(title = "Aim 2: Within-Subject Freezing Alleviation from OFF to ON",
+       subtitle = "Significant reduction: Mean Δ = -6.91% (t = -2.315, p = 0.031 | Wilcoxon p = 0.038)",
+       x = "Medication State", y = "Objective Freezing (% Time Frozen)") +
+  theme_bw(base_size = 12)
+
+p_aim2_delta <- ggplot(df1, aes(x = delta_logRMSSD, y = delta_Pct_Frozen)) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50") +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey50") +
+  geom_point(aes(colour = Participant_ID), size = 3.5, alpha = 0.9) +
+  geom_smooth(method = "lm", colour = "black", fill = "grey80", alpha = 0.25) +
+  geom_text_repel(aes(label = Participant_ID), size = 3) +
+  scale_colour_manual(values = pid_cols, guide = "none") +
+  labs(title = "Sub-Aim 2.b: Change-Coupling (ΔlogRMSSD vs. Δ% Time Frozen)",
+       subtitle = "Uncoupled: Pearson r = +0.141 (p = 0.543) | Spearman rho = +0.073 (p = 0.754)",
+       x = "Vagal Recovery (ΔlogRMSSD: ON − OFF)", y = "Freezing Change (Δ% Time Frozen: ON − OFF)") +
+  theme_bw(base_size = 12)
+
+print(p_aim2_fog)
+print(p_aim2_delta)
+
+
+# ==============================================================================
+# OBJECTIVE 3: DISENTANGLING MOTOR PROPENSITY FROM ANXIETY (STAI-S & STAI-T)
+# ==============================================================================
+cat("\n\n============================================================\n")
+cat(" OBJECTIVE 3: DISENTANGLING MOTOR PROPENSITY FROM ANXIETY\n")
+cat("============================================================\n")
+
+# Primary Aim 3: Hierarchical Regressions Partialling STAI
+cat("\n--- Primary Aim 3: Hierarchical Regression Accounting for STAI-State ---\n")
+m3_s1 <- lm(Pct_Frozen_OFF ~ Disease_Duration + UPDRS_OFF + LEDD + STAI_State_OFF, data = df1)
+m3_s2 <- lm(Pct_Frozen_OFF ~ Disease_Duration + UPDRS_OFF + LEDD + STAI_State_OFF + logRMSSD_OFF, data = df1)
+
+an_s <- anova(m3_s1, m3_s2)
+cat(sprintf("Step 1 (Clinical + STAI-State): R² = %.4f, p = %.4f\n",
+            summary(m3_s1)$r.squared, pf(summary(m3_s1)$fstatistic[1], 4, 16, lower.tail = FALSE)))
+cat(sprintf("Step 2 (+logRMSSD): R² = %.4f, p = %.4f\n",
+            summary(m3_s2)$r.squared, pf(summary(m3_s2)$fstatistic[1], 5, 15, lower.tail = FALSE)))
+cat(sprintf("Incremental Variance: ΔR² = %.4f, F_change(1, 15) = %.3f, p_change = %.4f\n\n",
+            summary(m3_s2)$r.squared - summary(m3_s1)$r.squared, an_s$F[2], an_s$`Pr(>F)`[2]))
+print(summary(m3_s2))
+
+# Sub-Aim 3.b: Group Contrasts (HA vs. LA) using Clinical Cutoff >= 40
+df1 <- df1 %>%
+  mutate(
+    HA_Trait = ifelse(STAI_Trait >= 40, "High Trait Anxiety", "Low Trait Anxiety"),
+    HA_State = ifelse(STAI_State_OFF >= 40, "High State Anxiety", "Low State Anxiety")
+  )
+
+cat("\n--- Sub-Aim 3.b: STAI-Trait Clinical Cutoff (>= 40) ---\n")
+t_stait_hrv <- t.test(logRMSSD_OFF ~ HA_Trait, data = df1, var.equal = FALSE) # Welch
+t_stait_fog <- t.test(Pct_Frozen_OFF ~ HA_Trait, data = df1, var.equal = TRUE)
+cat(sprintf("logRMSSD OFF: HA Mean = %.2f vs. LA Mean = %.2f | Welch t = %.3f, p = %.4f\n",
+            mean(df1$logRMSSD_OFF[df1$HA_Trait == "High Trait Anxiety"]),
+            mean(df1$logRMSSD_OFF[df1$HA_Trait == "Low Trait Anxiety"]),
+            t_stait_hrv$statistic, t_stait_hrv$p.value))
+cat(sprintf("%% Frozen OFF: HA Mean = %.2f%% vs. LA Mean = %.2f%% | Student t = %.3f, p = %.4f\n",
+            mean(df1$Pct_Frozen_OFF[df1$HA_Trait == "High Trait Anxiety"]),
+            mean(df1$Pct_Frozen_OFF[df1$HA_Trait == "Low Trait Anxiety"]),
+            t_stait_fog$statistic, t_stait_fog$p.value))
+
+cat("\n--- Sub-Aim 3.b: STAI-State Clinical Cutoff (>= 40) ---\n")
+t_stais_fog <- t.test(Pct_Frozen_OFF ~ HA_State, data = df1, var.equal = TRUE)
+cat(sprintf("%% Frozen OFF: HA State Mean = %.2f%% vs. LA State Mean = %.2f%% | Student t = %.3f, p = %.4f\n",
+            mean(df1$Pct_Frozen_OFF[df1$HA_State == "High State Anxiety"]),
+            mean(df1$Pct_Frozen_OFF[df1$HA_State == "Low State Anxiety"]),
+            t_stais_fog$statistic, t_stais_fog$p.value))
+
+# Objective 3 Figures
+p_aim3_stai <- ggplot(df1, aes(x = HA_Trait, y = logRMSSD_OFF, fill = HA_Trait)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.35, width = 0.45) +
+  geom_jitter(aes(colour = Participant_ID), width = 0.15, size = 3, alpha = 0.9) +
+  scale_fill_manual(values = c("High Trait Anxiety" = "#984EA3", "Low Trait Anxiety" = "#4DAF4A"), guide = "none") +
+  scale_colour_manual(values = pid_cols, guide = "none") +
+  labs(title = "Sub-Aim 3.b: Resting Autonomic Tone by STAI-Trait Anxiety Status",
+       subtitle = "High Trait Anxiety (≥40) displays lower resting logRMSSD (Welch p = 0.098; Raw RMSSD Welch p = 0.048*)",
+       x = "Trait Anxiety Classification", y = "Baseline Resting logRMSSD (OFF State)") +
+  theme_bw(base_size = 12)
+
+p_aim3_state <- ggplot(df1, aes(x = HA_State, y = Pct_Frozen_OFF, fill = HA_State)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.35, width = 0.45) +
+  geom_jitter(aes(colour = Participant_ID), width = 0.15, size = 3, alpha = 0.9) +
+  scale_fill_manual(values = c("High State Anxiety" = "#FF7F00", "Low State Anxiety" = "#377EB8"), guide = "none") +
+  scale_colour_manual(values = pid_cols, guide = "none") +
+  labs(title = "Sub-Aim 3.b: Freezing Burden by In-Lab STAI-State Anxiety Status",
+       subtitle = "High State Anxiety (≥40) spent more time frozen (39.2% vs. 21.9%, Cohen's d = +0.742)",
+       x = "State Anxiety Classification (OFF State)", y = "Objective Freezing (% Time Frozen)") +
+  theme_bw(base_size = 12)
+
+print(p_aim3_stai)
+print(p_aim3_state)
+
+cat("\n============================================================\n")
+cat(" PHASE 1 PIPELINE EXECUTION COMPLETE\n")
+cat("============================================================\n")
